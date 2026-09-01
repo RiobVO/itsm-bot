@@ -5,7 +5,6 @@ description = "Telegram intake bot for the internal IT service desk"
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.15",
-    "anthropic>=1.0,<2",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "sqlalchemy[asyncio]>=2.0",
