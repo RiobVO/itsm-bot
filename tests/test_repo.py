@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,7 +68,6 @@ class TestCreateTicket:
             session,
             employee=employee,
             text="Принтер не печатает",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -87,7 +87,6 @@ class TestCreateTicket:
             session,
             employee=employee,
             text="Не работает телефон",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -112,7 +111,6 @@ class TestCreateTicket:
             session,
             employee=employee,
             text="Первая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -120,7 +118,6 @@ class TestCreateTicket:
             session,
             employee=employee,
             text="Вторая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=11,
         )
@@ -156,7 +153,6 @@ class TestStatus:
             session,
             employee=employee,
             text="Текст",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -173,7 +169,6 @@ class TestStatus:
             session,
             employee=employee,
             text="Текст",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -190,7 +185,6 @@ class TestStatus:
             session,
             employee=employee,
             text="Текст",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -214,7 +208,6 @@ class TestDeduplication:
             session,
             employee=employee,
             text="Не печатает принтер",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -236,7 +229,6 @@ class TestDeduplication:
             session,
             employee=employee,
             text="Не печатает принтер",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -260,7 +252,6 @@ class TestDeduplication:
             session,
             employee=employee,
             text="Не печатает принтер",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -283,7 +274,6 @@ class TestDeduplication:
             session,
             employee=employee,
             text="Не печатает принтер",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -308,7 +298,6 @@ class TestRateLimit:
             session,
             employee=employee,
             text="Свежая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -316,7 +305,6 @@ class TestRateLimit:
             session,
             employee=employee,
             text="Старая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=11,
         )
@@ -340,7 +328,6 @@ class TestOpenTickets:
             session,
             employee=employee,
             text="Открытая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -348,7 +335,6 @@ class TestOpenTickets:
             session,
             employee=employee,
             text="Закрытая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=11,
         )
@@ -366,7 +352,6 @@ class TestOpenTickets:
             session,
             employee=employee,
             text="Чужая",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -386,7 +371,6 @@ class TestTicketMessages:
             session,
             employee=employee,
             text="Текст",
-            security_flag=False,
             source_chat_id=1,
             source_message_id=10,
         )
@@ -405,3 +389,217 @@ class TestTicketMessages:
             MessageDirection.FROM_REQUESTER,
         ]
         assert messages[1].text == "214"
+
+
+class TestRedactionIsEnforced:
+    """N8: сырой текст не попадает в БД, чем бы ни был занят вызывающий.
+
+    Маскирование встроено в слой хранения, поэтому забыть его нельзя.
+    """
+
+    async def test_secret_never_reaches_the_ticket(self, session: AsyncSession) -> None:
+        employee = await _employee(session)
+
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Не заходит почта, пароль: Zavod2024!",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        stored = (await session.execute(text("SELECT text FROM tickets"))).scalar_one()
+        assert "Zavod2024!" not in stored
+        assert "[REDACTED:secret]" in stored
+        assert ticket.security_flag is True
+
+    async def test_flag_stays_false_without_secrets(
+        self, session: AsyncSession
+    ) -> None:
+        employee = await _employee(session)
+
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Не печатает принтер в 214",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        assert ticket.security_flag is False
+        assert ticket.text == "Не печатает принтер в 214"
+
+    async def test_secret_never_reaches_a_reply(self, session: AsyncSession) -> None:
+        """Ответ сотрудника — такой же непроверенный ввод, как и само обращение."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        await repo.add_message(
+            session,
+            ticket.id,
+            MessageDirection.FROM_REQUESTER,
+            "мой пароль Qwerty12345",
+        )
+
+        stored = (
+            await session.execute(text("SELECT text FROM ticket_messages"))
+        ).scalar_one()
+        assert "Qwerty12345" not in stored
+
+    async def test_hash_is_built_from_masked_text(self, session: AsyncSession) -> None:
+        """Иначе хеш сам стал бы оракулом: подбор по нему восстанавливает секрет."""
+        employee = await _employee(session)
+
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="пароль: Zavod2024!",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        assert ticket.text_hash == repo.text_hash("пароль: [REDACTED:secret]")
+
+
+class TestStoredEnumValues:
+    """Значения перечислений в БД совпадают с контрактом из TODO.md.
+
+    SQLAlchemy по умолчанию пишет имя члена (`IN_PROGRESS`), а не значение
+    (`in_progress`), и документированный запрос `status = 'done'` не находит ничего.
+    """
+
+    async def test_status_is_stored_as_its_value(self, session: AsyncSession) -> None:
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        await repo.set_status(session, ticket.id, TicketStatus.IN_PROGRESS)
+
+        stored = (
+            await session.execute(text("SELECT status FROM tickets"))
+        ).scalar_one()
+        assert stored == "in_progress"
+
+    async def test_documented_query_finds_closed_tickets(
+        self, session: AsyncSession
+    ) -> None:
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+        await repo.set_status(session, ticket.id, TicketStatus.DONE)
+
+        found = (
+            await session.execute(
+                text("SELECT count(*) FROM tickets WHERE status = 'done'")
+            )
+        ).scalar_one()
+        assert found == 1
+
+    async def test_direction_is_stored_as_its_value(
+        self, session: AsyncSession
+    ) -> None:
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        await repo.add_message(
+            session, ticket.id, MessageDirection.TO_REQUESTER, "Вопрос"
+        )
+
+        stored = (
+            await session.execute(text("SELECT direction FROM ticket_messages"))
+        ).scalar_one()
+        assert stored == "to_requester"
+
+    async def test_invalid_status_is_rejected_by_the_database(
+        self, session: AsyncSession
+    ) -> None:
+        """CHECK-констрейнт: опечатка в ручном UPDATE не создаёт несуществующий статус."""
+        employee = await _employee(session)
+        await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        with pytest.raises(IntegrityError):
+            await session.execute(text("UPDATE tickets SET status = 'чушь'"))
+            await session.commit()
+
+
+class TestConcurrentStatusChanges:
+    """Отметки времени не должны зависеть от того, что успела увидеть сессия."""
+
+    async def test_reopening_clears_closure_made_in_another_session(
+        self, session: AsyncSession, session_factory
+    ) -> None:
+        """Две кнопки по одной заявке не оставляют «в работе» с датой закрытия."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+        ticket_id = ticket.id
+
+        async with session_factory() as stale, session_factory() as closer:
+            await repo.get_ticket(stale, ticket_id)  # снимок до закрытия
+            await repo.set_status(closer, ticket_id, TicketStatus.DONE)
+            await repo.set_status(stale, ticket_id, TicketStatus.IN_PROGRESS)
+
+        async with session_factory() as check:
+            final = await repo.get_ticket(check, ticket_id)
+            assert final is not None
+            assert final.status is TicketStatus.IN_PROGRESS
+            assert final.closed_at is None
+
+    async def test_taken_at_survives_a_second_take(
+        self, session: AsyncSession, session_factory
+    ) -> None:
+        """Повторное «в работу» не сдвигает момент взятия — иначе метрика соврёт."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+        ticket_id = ticket.id
+
+        first = await repo.set_status(session, ticket_id, TicketStatus.IN_PROGRESS)
+        assert first is not None
+        original_taken_at = first.taken_at
+
+        async with session_factory() as other:
+            await repo.set_status(other, ticket_id, TicketStatus.IN_PROGRESS)
+
+        async with session_factory() as check:
+            final = await repo.get_ticket(check, ticket_id)
+            assert final is not None
+            assert final.taken_at == original_taken_at

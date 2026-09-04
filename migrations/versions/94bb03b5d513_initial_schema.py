@@ -1,8 +1,8 @@
 """initial schema
 
-Revision ID: 0d195eef9b62
+Revision ID: 94bb03b5d513
 Revises: 
-Create Date: 2026-09-14 09:44:55.948705
+Create Date: 2026-09-14 10:18:06.283389
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '0d195eef9b62'
+revision: str = '94bb03b5d513'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -34,7 +34,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('requester_id', sa.String(length=32), nullable=False),
     sa.Column('text', sa.Text(), nullable=False),
-    sa.Column('status', sa.Enum('NEW', 'IN_PROGRESS', 'DONE', 'CANCELLED', name='ticketstatus', native_enum=False, length=16), nullable=False),
+    sa.Column('status', sa.Enum('new', 'in_progress', 'done', 'cancelled', name='ticketstatus', native_enum=False, create_constraint=True, length=16), nullable=False),
     sa.Column('room_snapshot', sa.String(length=64), nullable=False),
     sa.Column('department_snapshot', sa.String(length=128), nullable=False),
     sa.Column('security_flag', sa.Boolean(), nullable=False),
@@ -58,7 +58,7 @@ def upgrade() -> None:
     op.create_table('ticket_messages',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('ticket_id', sa.Integer(), nullable=False),
-    sa.Column('direction', sa.Enum('TO_REQUESTER', 'FROM_REQUESTER', name='messagedirection', native_enum=False, length=16), nullable=False),
+    sa.Column('direction', sa.Enum('to_requester', 'from_requester', name='messagedirection', native_enum=False, create_constraint=True, length=16), nullable=False),
     sa.Column('text', sa.Text(), nullable=False),
     sa.Column('created_at', sa.DateTime(), nullable=False),
     sa.ForeignKeyConstraint(['ticket_id'], ['tickets.id'], ondelete='CASCADE'),

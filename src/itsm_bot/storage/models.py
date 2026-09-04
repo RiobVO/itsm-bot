@@ -61,6 +61,27 @@ class Base(DeclarativeBase):
     pass
 
 
+def _enum_column(enum_type: type[StrEnum], name: str) -> Enum:
+    """Колонка-перечисление, хранящая значения, а не имена членов.
+
+    По умолчанию SQLAlchemy пишет в БД имя члена (`IN_PROGRESS`), а не его значение
+    (`in_progress`) — и документированный в TODO.md запрос `status = 'done'` не
+    находит ни одной строки. `values_callable` возвращает контракт схемы на место.
+
+    `create_constraint` добавляет CHECK: без него SQLite принимает любую строку,
+    и опечатка в ручном UPDATE тихо создаёт несуществующий статус.
+    """
+    return Enum(
+        enum_type,
+        name=name,
+        native_enum=False,
+        length=16,
+        validate_strings=True,
+        create_constraint=True,
+        values_callable=lambda members: [member.value for member in members],
+    )
+
+
 class TicketStatus(StrEnum):
     """Жизненный цикл заявки при одном исполнителе (решение D8)."""
 
@@ -110,7 +131,7 @@ class Ticket(Base):
     """Замаскированный текст, склеенный из пачки сообщений (F5)."""
 
     status: Mapped[TicketStatus] = mapped_column(
-        Enum(TicketStatus, native_enum=False, length=16, validate_strings=True),
+        _enum_column(TicketStatus, "ticketstatus"),
         default=TicketStatus.NEW,
     )
 
@@ -162,7 +183,7 @@ class TicketMessage(Base):
         ForeignKey("tickets.id", ondelete="CASCADE"), index=True
     )
     direction: Mapped[MessageDirection] = mapped_column(
-        Enum(MessageDirection, native_enum=False, length=16, validate_strings=True)
+        _enum_column(MessageDirection, "messagedirection")
     )
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)

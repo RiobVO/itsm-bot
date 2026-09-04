@@ -12,9 +12,10 @@ import logging
 import re
 from datetime import timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from itsm_bot.security.redactor import redact
 from itsm_bot.storage.models import (
     Employee,
     MessageDirection,
@@ -34,10 +35,15 @@ _WHITESPACE = re.compile(r"\s+")
 def text_hash(text: str) -> str:
     """Хеш текста для дедупликации (N11).
 
-    Регистр и переносы строк нормализуются: человек, повторяющий обращение, редко
-    воспроизводит его посимвольно, а пачка сообщений склеивается переводами строки.
+    Нормализуются только пробелы и переносы строк — пачка сообщений склеивается
+    через них, и одно и то же обращение не должно разойтись по такой мелочи.
+
+    Регистр намеренно сохраняется. Ошибка дедупа асимметрична: лишняя заявка стоит
+    одного клика, потерянная — пропавшего обращения. Понижение регистра слило бы
+    `/opt/App` и `/opt/app` в один хеш, а типичный повтор человек присылает
+    копипастой, где регистр и так совпадает.
     """
-    normalized = _WHITESPACE.sub(" ", text).strip().lower()
+    normalized = _WHITESPACE.sub(" ", text).strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -76,7 +82,6 @@ async def create_ticket(
     *,
     employee: Employee,
     text: str,
-    security_flag: bool,
     source_chat_id: int,
     source_message_id: int,
 ) -> Ticket:
@@ -84,17 +89,25 @@ async def create_ticket(
 
     Копия, а не ссылка: сотрудник переедет, а заявка должна помнить, куда тогда
     шёл исполнитель.
+
+    Маскирование выполняется здесь, а не доверяется вызывающему. Требование «сырой
+    текст не попадает в БД» — главное в проекте, и оно должно держаться на
+    конструкции, а не на памяти того, кто напишет следующий хендлер. Повторный
+    прогон уже замаскированного текста безвреден: плейсхолдеры маскированию не
+    поддаются.
     """
+    redaction = redact(text)
+
     ticket = Ticket(
         requester_id=employee.telegram_id,
-        text=text,
+        text=redaction.text,
         status=TicketStatus.NEW,
         room_snapshot=employee.room,
         department_snapshot=employee.department,
-        security_flag=security_flag,
+        security_flag=redaction.found,
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
-        text_hash=text_hash(text),
+        text_hash=text_hash(redaction.text),
     )
     session.add(ticket)
     await session.commit()
@@ -103,7 +116,7 @@ async def create_ticket(
         "Заявка #%s создана сотрудником %s, security_flag=%s",
         ticket.id,
         employee.telegram_id,
-        security_flag,
+        redaction.found,
     )
     return ticket
 
@@ -115,20 +128,37 @@ async def set_status(
 
     Возврат из закрытого статуса очищает `closed_at`: иначе заявка окажется
     закрытой по времени и открытой по статусу, и отчёт по длительности соврёт.
+
+    Все три поля пишутся одним UPDATE, а `taken_at` вычисляется через COALESCE в
+    самой БД. Через ORM-атрибуты это было бы хрупко: присвоение того же значения,
+    что уже лежит в снимке сессии, не помечает поле изменённым, и оно молча
+    выпадает из UPDATE. Тогда исход зависел бы от состояния кеша сессии — а два
+    нажатия кнопок по одной заявке дали бы статус «в работе» с датой закрытия.
     """
     ticket = await session.get(Ticket, ticket_id)
     if ticket is None:
         logger.warning("Попытка сменить статус несуществующей заявки #%s", ticket_id)
         return None
 
-    ticket.status = status
+    now = utcnow()
+    taken_at = (
+        func.coalesce(Ticket.taken_at, now)
+        if status is TicketStatus.IN_PROGRESS
+        else Ticket.taken_at
+    )
 
-    if status is TicketStatus.IN_PROGRESS and ticket.taken_at is None:
-        ticket.taken_at = utcnow()
-
-    ticket.closed_at = utcnow() if status in CLOSED_STATUSES else None
-
+    await session.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket_id)
+        .values(
+            status=status,
+            taken_at=taken_at,
+            closed_at=now if status in CLOSED_STATUSES else None,
+        )
+    )
     await session.commit()
+    await session.refresh(ticket)
+
     logger.info("Заявка #%s переведена в статус %s", ticket_id, status.value)
     return ticket
 
@@ -202,8 +232,14 @@ async def queue(session: AsyncSession) -> list[Ticket]:
 async def add_message(
     session: AsyncSession, ticket_id: int, direction: MessageDirection, text: str
 ) -> TicketMessage:
-    """Добавляет реплику в переписку по заявке (F8)."""
-    message = TicketMessage(ticket_id=ticket_id, direction=direction, text=text)
+    """Добавляет реплику в переписку по заявке (F8).
+
+    Маскируется здесь по той же причине, что и текст заявки: ответ сотрудника —
+    такой же непроверенный ввод, и пароль он присылает в него не реже.
+    """
+    message = TicketMessage(
+        ticket_id=ticket_id, direction=direction, text=redact(text).text
+    )
     session.add(message)
     await session.commit()
     return message
