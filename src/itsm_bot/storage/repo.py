@@ -15,7 +15,7 @@ from datetime import timedelta
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from itsm_bot.security.redactor import redact
+from itsm_bot.security.redactor import PII_PLACEHOLDER, SECRET_PLACEHOLDER, redact
 from itsm_bot.storage.models import (
     Employee,
     MessageDirection,
@@ -30,6 +30,24 @@ logger = logging.getLogger(__name__)
 CLOSED_STATUSES = (TicketStatus.DONE, TicketStatus.CANCELLED)
 
 _WHITESPACE = re.compile(r"\s+")
+
+
+def mask(text: str) -> tuple[str, bool]:
+    """Маскирует текст и говорит, были ли в нём секреты.
+
+    Замаскированный текст при повторном прогоне не меняется, а вот признак находки
+    — меняется: во второй раз `redact()` видит уже только плейсхолдеры и возвращает
+    `found=False`. Если бы флаг брался прямо оттуда, текст, замаскированный где-то
+    выше по конвейеру, сохранился бы с `security_flag=False`, и сотрудник не получил
+    бы предупреждения о присланном пароле.
+
+    Поэтому уже готовый плейсхолдер во входе считается таким же признаком, как и
+    собственная находка. Сотрудник, приславший «[REDACTED:secret]» вручную, получит
+    лишнее предупреждение — это дешевле пропущенного настоящего секрета.
+    """
+    already_masked = SECRET_PLACEHOLDER in text or PII_PLACEHOLDER in text
+    result = redact(text)
+    return result.text, result.found or already_masked
 
 
 def text_hash(text: str) -> str:
@@ -92,22 +110,22 @@ async def create_ticket(
 
     Маскирование выполняется здесь, а не доверяется вызывающему. Требование «сырой
     текст не попадает в БД» — главное в проекте, и оно должно держаться на
-    конструкции, а не на памяти того, кто напишет следующий хендлер. Повторный
-    прогон уже замаскированного текста безвреден: плейсхолдеры маскированию не
-    поддаются.
+    конструкции, а не на памяти того, кто напишет следующий хендлер. Хендлеру
+    вызывать `redact()` не нужно: `mask()` переживает повторный прогон вместе с
+    флагом.
     """
-    redaction = redact(text)
+    masked_text, security_flag = mask(text)
 
     ticket = Ticket(
         requester_id=employee.telegram_id,
-        text=redaction.text,
+        text=masked_text,
         status=TicketStatus.NEW,
         room_snapshot=employee.room,
         department_snapshot=employee.department,
-        security_flag=redaction.found,
+        security_flag=security_flag,
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
-        text_hash=text_hash(redaction.text),
+        text_hash=text_hash(masked_text),
     )
     session.add(ticket)
     await session.commit()
@@ -116,7 +134,7 @@ async def create_ticket(
         "Заявка #%s создана сотрудником %s, security_flag=%s",
         ticket.id,
         employee.telegram_id,
-        redaction.found,
+        security_flag,
     )
     return ticket
 
@@ -147,7 +165,7 @@ async def set_status(
         else Ticket.taken_at
     )
 
-    await session.execute(
+    result = await session.execute(
         update(Ticket)
         .where(Ticket.id == ticket_id)
         .values(
@@ -157,8 +175,15 @@ async def set_status(
         )
     )
     await session.commit()
-    await session.refresh(ticket)
 
+    if result.rowcount == 0:
+        # Заявка исчезла между чтением и записью. `refresh()` на такой строке
+        # бросает InvalidRequestError, поэтому проверяем до него.
+        logger.warning("Заявка #%s исчезла во время смены статуса", ticket_id)
+        session.expunge(ticket)
+        return None
+
+    await session.refresh(ticket)
     logger.info("Заявка #%s переведена в статус %s", ticket_id, status.value)
     return ticket
 
@@ -183,12 +208,19 @@ async def find_recent_duplicate(
 
     Одинаковый текст от разных людей дублем не считается: про один сломанный
     принтер пишут несколько человек, и это разные обращения.
+
+    Текст маскируется перед хешированием, потому что в БД лежат хеши от
+    замаскированного. Без этого повтор обращения с паролем внутри никогда бы не
+    совпал сам с собой, и дедупликация молча отключалась бы именно на тех
+    обращениях, где заявителю важнее всего получить один ответ, а не два.
     """
+    masked_text, _ = mask(text)
+
     statement = (
         select(Ticket)
         .where(
             Ticket.requester_id == requester_id,
-            Ticket.text_hash == text_hash(text),
+            Ticket.text_hash == text_hash(masked_text),
             Ticket.created_at >= utcnow() - window,
         )
         .order_by(Ticket.id.desc())
@@ -237,9 +269,8 @@ async def add_message(
     Маскируется здесь по той же причине, что и текст заявки: ответ сотрудника —
     такой же непроверенный ввод, и пароль он присылает в него не реже.
     """
-    message = TicketMessage(
-        ticket_id=ticket_id, direction=direction, text=redact(text).text
-    )
+    masked_text, _ = mask(text)
+    message = TicketMessage(ticket_id=ticket_id, direction=direction, text=masked_text)
     session.add(message)
     await session.commit()
     return message

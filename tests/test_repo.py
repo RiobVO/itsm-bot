@@ -265,6 +265,33 @@ class TestDeduplication:
 
         assert duplicate is None
 
+    async def test_duplicate_is_found_in_text_containing_a_secret(
+        self, session: AsyncSession
+    ) -> None:
+        """В БД лежит хеш замаскированного текста — искать надо по такому же.
+
+        Иначе дедупликация молча отключается именно на обращениях с паролем, где
+        заявителю особенно не нужен второй ответ на то же самое.
+        """
+        employee = await _employee(session)
+        raw = "не пускает почта, пароль: Zavod2024!"
+        await repo.create_ticket(
+            session,
+            employee=employee,
+            text=raw,
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        duplicate = await repo.find_recent_duplicate(
+            session,
+            requester_id=REQUESTER,
+            text=raw,
+            window=timedelta(minutes=10),
+        )
+
+        assert duplicate is not None
+
     async def test_same_text_from_another_employee_is_not_a_duplicate(
         self, session: AsyncSession
     ) -> None:
@@ -452,6 +479,27 @@ class TestRedactionIsEnforced:
         ).scalar_one()
         assert "Qwerty12345" not in stored
 
+    async def test_flag_survives_text_masked_further_up_the_pipeline(
+        self, session: AsyncSession
+    ) -> None:
+        """Текст идемпотентен, а находка — нет: второй `redact()` видит плейсхолдер.
+
+        Если бы флаг брался прямо из второго прогона, заявка с уже замаскированным
+        текстом сохранилась бы с `security_flag=False` и сотрудник не получил бы
+        предупреждения.
+        """
+        employee = await _employee(session)
+
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="токен: [REDACTED:secret]",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+
+        assert ticket.security_flag is True
+
     async def test_hash_is_built_from_masked_text(self, session: AsyncSession) -> None:
         """Иначе хеш сам стал бы оракулом: подбор по нему восстанавливает секрет."""
         employee = await _employee(session)
@@ -568,15 +616,52 @@ class TestConcurrentStatusChanges:
         ticket_id = ticket.id
 
         async with session_factory() as stale, session_factory() as closer:
-            await repo.get_ticket(stale, ticket_id)  # снимок до закрытия
+            # Ссылку на объект нужно удерживать: identity map у SQLAlchemy слабая,
+            # без живой ссылки снимок вытесняется, сессия перечитывает строку — и
+            # тест проходит даже на реализации, которая теряет closed_at.
+            held = await repo.get_ticket(stale, ticket_id)
+            assert held is not None
+
             await repo.set_status(closer, ticket_id, TicketStatus.DONE)
             await repo.set_status(stale, ticket_id, TicketStatus.IN_PROGRESS)
+
+            assert held is not None  # ссылка жива до конца блока
 
         async with session_factory() as check:
             final = await repo.get_ticket(check, ticket_id)
             assert final is not None
             assert final.status is TicketStatus.IN_PROGRESS
             assert final.closed_at is None
+
+    async def test_vanished_ticket_returns_none_instead_of_raising(
+        self, session: AsyncSession, session_factory
+    ) -> None:
+        """Заявка может исчезнуть между чтением и записью.
+
+        `refresh()` на удалённой строке бросает InvalidRequestError — вызывающий
+        получил бы исключение вместо понятного None.
+        """
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session,
+            employee=employee,
+            text="Текст",
+            source_chat_id=1,
+            source_message_id=10,
+        )
+        ticket_id = ticket.id
+
+        async with session_factory() as victim, session_factory() as killer:
+            held = await repo.get_ticket(victim, ticket_id)
+            assert held is not None  # ссылку держим, иначе снимок вытеснится
+
+            await killer.execute(
+                text("DELETE FROM tickets WHERE id = :id"), {"id": ticket_id}
+            )
+            await killer.commit()
+
+            assert await repo.set_status(victim, ticket_id, TicketStatus.DONE) is None
+            assert held is not None
 
     async def test_taken_at_survives_a_second_take(
         self, session: AsyncSession, session_factory
