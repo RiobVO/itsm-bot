@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from itsm_bot.security.redactor import PII_PLACEHOLDER, SECRET_PLACEHOLDER, redact
 from itsm_bot.storage.models import (
     Employee,
+    Language,
     MessageDirection,
     Ticket,
     TicketMessage,
@@ -76,16 +77,24 @@ async def save_employee(
     display_name: str | None,
     room: str,
     department: str,
+    language: Language,
 ) -> Employee:
-    """Создаёт профиль или обновляет существующий (F1, F3)."""
+    """Создаёт профиль или обновляет существующий (F1, F3).
+
+    Кабинет маскируется здесь по той же причине, что и текст заявки: это
+    единственное поле профиля со свободным вводом, и любой сбой анкеты превращает
+    его в приёмник произвольного текста. Требование N8 не должно зависеть от того,
+    все ли ветки хендлеров написаны правильно.
+    """
     employee = await session.get(Employee, telegram_id)
     if employee is None:
         employee = Employee(telegram_id=telegram_id)
         session.add(employee)
 
     employee.display_name = display_name
-    employee.room = room
+    employee.room, _ = mask(room)
     employee.department = department
+    employee.language = language
 
     await session.commit()
     return employee

@@ -13,18 +13,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from itsm_bot.storage import repo
-from itsm_bot.storage.models import MessageDirection, TicketStatus
+from itsm_bot.storage.models import Language, MessageDirection, TicketStatus
 
 REQUESTER = "584112903"
 
 
-async def _employee(session: AsyncSession, telegram_id: str = REQUESTER):
+async def _employee(
+    session: AsyncSession,
+    telegram_id: str = REQUESTER,
+    language: Language = Language.RU,
+):
     return await repo.save_employee(
         session,
         telegram_id=telegram_id,
         display_name="Иванов Пётр",
         room="214",
         department="Бухгалтерия",
+        language=language,
     )
 
 
@@ -50,6 +55,7 @@ class TestEmployee:
             display_name="Иванов Пётр",
             room="301",
             department="Бухгалтерия",
+            language=Language.RU,
         )
 
         found = await repo.get_employee(session, REQUESTER)
@@ -58,6 +64,52 @@ class TestEmployee:
 
     async def test_unknown_employee_is_none(self, session: AsyncSession) -> None:
         assert await repo.get_employee(session, "нет такого") is None
+
+
+class TestRoomMasking:
+    async def test_secret_in_room_is_masked(self, session: AsyncSession) -> None:
+        """Сбой анкеты превращает кабинет в приёмник произвольного текста (N8)."""
+        await repo.save_employee(
+            session,
+            telegram_id=REQUESTER,
+            display_name="Иванов Пётр",
+            room="пароль qwerty123",
+            department="Бухгалтерия",
+            language=Language.RU,
+        )
+
+        found = await repo.get_employee(session, REQUESTER)
+
+        assert found is not None
+        assert "qwerty123" not in found.room
+
+    async def test_ordinary_room_is_untouched(self, session: AsyncSession) -> None:
+        await _employee(session)
+
+        found = await repo.get_employee(session, REQUESTER)
+
+        assert found is not None
+        assert found.room == "214"
+
+
+class TestLanguage:
+    async def test_language_is_stored_and_read_back(self, session: AsyncSession) -> None:
+        """D14: язык — свойство человека, уведомления F7 берут его отсюда."""
+        await _employee(session, language=Language.EN)
+
+        found = await repo.get_employee(session, REQUESTER)
+
+        assert found is not None
+        assert found.language is Language.EN
+
+    async def test_language_is_stored_as_value_not_member_name(
+        self, session: AsyncSession
+    ) -> None:
+        """Перечисление обязано лечь в БД значением — иначе `language = 'en'` не найдёт строку."""
+        await _employee(session, language=Language.EN)
+
+        stored = await session.execute(text("SELECT language FROM employees"))
+        assert stored.scalar_one() == "en"
 
 
 class TestCreateTicket:
@@ -97,6 +149,7 @@ class TestCreateTicket:
             display_name="Иванов Пётр",
             room="999",
             department="Логистика",
+            language=Language.RU,
         )
 
         found = await repo.get_ticket(session, ticket.id)

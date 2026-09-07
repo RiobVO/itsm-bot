@@ -96,6 +96,13 @@ class MessageDirection(StrEnum):
     FROM_REQUESTER = "from_requester"
 
 
+class Language(StrEnum):
+    """Язык ответов бота. Свойство человека, а не сообщения (D14)."""
+
+    RU = "ru"
+    EN = "en"
+
+
 class Employee(Base):
     """Профиль сотрудника: кабинет и отдел спрашиваются один раз (решение D2).
 
@@ -109,6 +116,13 @@ class Employee(Base):
     display_name: Mapped[str | None] = mapped_column(String(255))
     room: Mapped[str] = mapped_column(String(64))
     department: Mapped[str] = mapped_column(String(128))
+
+    language: Mapped[Language] = mapped_column(
+        _enum_column(Language, "language"), default=Language.RU
+    )
+    """Язык ответов: уведомление F7 уходит по действию исполнителя, и `language_code`
+    заявителя в том апдейте недоступен."""
+
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         UtcDateTime, default=utcnow, onupdate=utcnow
