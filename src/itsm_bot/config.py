@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_DB_PATH = Path("itsm.db")
 
@@ -46,7 +47,17 @@ class Settings(DatabaseSettings):
 
     bot_token: SecretStr
     queue_chat_id: int
-    """Закрытый канал исполнителя, куда попадают карточки заявок."""
+    """Закрытая группа исполнителя, куда попадают карточки заявок (D9)."""
+
+    departments: Annotated[list[str], NoDecode] = Field(min_length=1)
+    """D10: отдел выбирается кнопками из этого списка, свободного ввода нет.
+
+    `NoDecode` отключает разбор значения как JSON: без него pydantic-settings
+    попытается прочитать `DEPARTMENTS` как JSON-массив и упадёт раньше валидатора.
+    """
+
+    card_text_limit: int = Field(default=1200, ge=200)
+    """N12: сколько символов текста заявки помещается в карточку очереди."""
 
     buffer_seconds: int = Field(default=45, ge=5, le=300)
     """N3: сколько ждать после последнего сообщения, прежде чем собрать заявку."""
@@ -56,6 +67,14 @@ class Settings(DatabaseSettings):
 
     dedup_window_minutes: int = Field(default=10, ge=1)
     """N11: за какое окно повторный одинаковый текст не создаёт вторую заявку."""
+
+    @field_validator("departments", mode="before")
+    @classmethod
+    def _split_departments(cls, value: object) -> object:
+        """Список из строки через запятую — этот файл правят руками, не программой."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
 
 @lru_cache
