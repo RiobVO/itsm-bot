@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from itsm_bot.security.redactor import PII_PLACEHOLDER, SECRET_PLACEHOLDER, redact
@@ -292,3 +293,90 @@ async def ticket_messages(session: AsyncSession, ticket_id: int) -> list[TicketM
         .order_by(TicketMessage.id)
     )
     return list((await session.execute(statement)).scalars())
+
+
+async def tickets_awaiting_answer(
+    session: AsyncSession, *, requester_id: str
+) -> list[Ticket]:
+    """Открытые заявки сотрудника, последняя реплика в которых — вопрос исполнителя.
+
+    Состояние «ждёт ответа» выводится из переписки, а не хранится колонкой (D15):
+    отдельный флаг пришлось бы снимать в каждой ветке смены статуса, и он бы
+    рассинхронизировался на первой же пропущенной.
+    """
+    last_direction = (
+        select(TicketMessage.direction)
+        .where(TicketMessage.ticket_id == Ticket.id)
+        .order_by(TicketMessage.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    statement = (
+        select(Ticket)
+        .where(
+            Ticket.requester_id == requester_id,
+            Ticket.status.not_in(CLOSED_STATUSES),
+            last_direction == MessageDirection.TO_REQUESTER,
+        )
+        .order_by(Ticket.id)
+    )
+    return list((await session.execute(statement)).scalars())
+
+
+@dataclass(frozen=True)
+class Stats:
+    """Сводка для /stats (F11)."""
+
+    created: int
+    closed: int
+    avg_seconds_to_close: float | None
+    top_requesters: list[tuple[str, str | None, int]]
+
+
+async def stats(session: AsyncSession, *, window: timedelta) -> Stats:
+    """Сводка за окно.
+
+    Среднее считается в Python, а не в SQL: при ~1200 заявках в год (N2) выборка
+    заведомо мала, а `julianday` и арифметика дат в SQLite читаются хуже, чем
+    вычитание двух `datetime`.
+    """
+    since = utcnow() - window
+
+    created = (
+        await session.execute(
+            select(func.count(Ticket.id)).where(Ticket.created_at >= since)
+        )
+    ).scalar_one()
+
+    durations = (
+        await session.execute(
+            select(Ticket.created_at, Ticket.closed_at).where(
+                Ticket.created_at >= since, Ticket.closed_at.is_not(None)
+            )
+        )
+    ).all()
+
+    top = (
+        await session.execute(
+            select(Ticket.requester_id, Employee.display_name, func.count(Ticket.id))
+            .join(Employee, Employee.telegram_id == Ticket.requester_id)
+            .where(Ticket.created_at >= since)
+            .group_by(Ticket.requester_id, Employee.display_name)
+            .order_by(desc(func.count(Ticket.id)), Ticket.requester_id)
+            .limit(5)
+        )
+    ).all()
+
+    average = (
+        sum((closed_at - created_at).total_seconds() for created_at, closed_at in durations)
+        / len(durations)
+        if durations
+        else None
+    )
+
+    return Stats(
+        created=created,
+        closed=len(durations),
+        avg_seconds_to_close=average,
+        top_requesters=[(str(row[0]), row[1], int(row[2])) for row in top],
+    )

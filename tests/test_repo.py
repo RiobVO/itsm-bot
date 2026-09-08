@@ -8,12 +8,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from itsm_bot.storage import repo
-from itsm_bot.storage.models import Language, MessageDirection, TicketStatus
+from itsm_bot.storage.models import Language, MessageDirection, Ticket, TicketStatus
 
 REQUESTER = "584112903"
 
@@ -741,3 +741,135 @@ class TestConcurrentStatusChanges:
             final = await repo.get_ticket(check, ticket_id)
             assert final is not None
             assert final.taken_at == original_taken_at
+
+
+class TestAwaitingAnswer:
+    """D15: ответ заявителя привязывается к заявке, у которой последняя реплика — вопрос."""
+
+    async def test_ticket_without_messages_is_not_awaiting(
+        self, session: AsyncSession
+    ) -> None:
+        employee = await _employee(session)
+        await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+
+        assert await repo.tickets_awaiting_answer(session, requester_id=REQUESTER) == []
+
+    async def test_ticket_with_question_is_awaiting(self, session: AsyncSession) -> None:
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+        await repo.add_message(
+            session, ticket.id, MessageDirection.TO_REQUESTER, "Какой этаж?"
+        )
+
+        awaiting = await repo.tickets_awaiting_answer(session, requester_id=REQUESTER)
+
+        assert [item.id for item in awaiting] == [ticket.id]
+
+    async def test_answered_ticket_stops_awaiting(self, session: AsyncSession) -> None:
+        """После ответа заявка перестаёт ловить следующие сообщения."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+        await repo.add_message(session, ticket.id, MessageDirection.TO_REQUESTER, "Какой этаж?")
+        await repo.add_message(session, ticket.id, MessageDirection.FROM_REQUESTER, "Третий")
+
+        assert await repo.tickets_awaiting_answer(session, requester_id=REQUESTER) == []
+
+    async def test_closed_ticket_never_awaits(self, session: AsyncSession) -> None:
+        """D12: сообщение по закрытой заявке заводит новую, а не дописывается в старую."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+        await repo.add_message(session, ticket.id, MessageDirection.TO_REQUESTER, "Какой этаж?")
+        await repo.set_status(session, ticket.id, TicketStatus.DONE)
+
+        assert await repo.tickets_awaiting_answer(session, requester_id=REQUESTER) == []
+
+    async def test_other_employees_tickets_are_not_returned(
+        self, session: AsyncSession
+    ) -> None:
+        other = await _employee(session, telegram_id="999")
+        ticket = await repo.create_ticket(
+            session, employee=other, text="Мышь", source_chat_id=2, source_message_id=2
+        )
+        await repo.add_message(session, ticket.id, MessageDirection.TO_REQUESTER, "Какая мышь?")
+
+        assert await repo.tickets_awaiting_answer(session, requester_id=REQUESTER) == []
+
+
+class TestStats:
+    async def test_counts_and_average_over_window(self, session: AsyncSession) -> None:
+        employee = await _employee(session)
+        closed = await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+        await repo.create_ticket(
+            session, employee=employee, text="Мышь", source_chat_id=1, source_message_id=2
+        )
+        created_at = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+        await session.execute(
+            update(Ticket)
+            .where(Ticket.id == closed.id)
+            .values(
+                status=TicketStatus.DONE,
+                created_at=created_at,
+                closed_at=created_at + timedelta(hours=2),
+            )
+        )
+        await session.commit()
+
+        summary = await repo.stats(session, window=timedelta(days=3650))
+
+        assert summary.created == 2
+        assert summary.closed == 1
+        assert summary.avg_seconds_to_close == pytest.approx(7200)
+
+    async def test_window_cuts_off_old_tickets(self, session: AsyncSession) -> None:
+        employee = await _employee(session)
+        old = await repo.create_ticket(
+            session, employee=employee, text="Старое", source_chat_id=1, source_message_id=1
+        )
+        await session.execute(
+            update(Ticket)
+            .where(Ticket.id == old.id)
+            .values(created_at=datetime(2020, 1, 1, tzinfo=UTC))
+        )
+        await session.commit()
+
+        summary = await repo.stats(session, window=timedelta(days=30))
+
+        assert summary.created == 0
+
+    async def test_top_requesters_are_sorted_by_count(self, session: AsyncSession) -> None:
+        first = await _employee(session)
+        second = await _employee(session, telegram_id="999")
+        for index in range(3):
+            await repo.create_ticket(
+                session,
+                employee=first,
+                text=f"Раз {index}",
+                source_chat_id=1,
+                source_message_id=index,
+            )
+        await repo.create_ticket(
+            session, employee=second, text="Два", source_chat_id=2, source_message_id=99
+        )
+
+        summary = await repo.stats(session, window=timedelta(days=1))
+
+        assert summary.top_requesters[0] == (REQUESTER, "Иванов Пётр", 3)
+        assert summary.top_requesters[1][2] == 1
+
+    async def test_empty_period_has_no_average(self, session: AsyncSession) -> None:
+        """Ни одной закрытой — среднего нет, а не ноль: ноль соврал бы про мгновенное закрытие."""
+        summary = await repo.stats(session, window=timedelta(days=30))
+
+        assert summary.created == 0
+        assert summary.avg_seconds_to_close is None
+        assert summary.top_requesters == []
