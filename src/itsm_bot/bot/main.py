@@ -105,8 +105,11 @@ def build_dispatcher(
         потерянное обращение. Человек должен об этом узнать: молчание он примет за
         принятую заявку и будет ждать ответа.
         """
-        language = await language_of(batch.telegram_id)
+        # Чтение языка тоже внутри `try`: пачка уже снята с буфера, и сбой на этом
+        # шаге уничтожил бы обращение молча — человек счёл бы заявку заведённой.
+        language = Language.RU
         try:
+            language = await language_of(batch.telegram_id)
             result = await intake.process(batch)
         except Exception:
             logger.exception(

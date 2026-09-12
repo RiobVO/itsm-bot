@@ -57,9 +57,13 @@ async def my_tickets(message: Message, session: AsyncSession) -> None:
     employee = await repo.get_employee(session, telegram_id)
     tickets = await repo.open_tickets(session, requester_id=telegram_id)
 
-    await message.answer(
-        cards.my_tickets_text(tickets, employee.language if employee else Language.RU)
+    text = cards.my_tickets_text(
+        tickets, employee.language if employee else Language.RU
     )
+    # Список может перерасти лимит Telegram: рейт-лимит N10 разрешает до пяти
+    # заявок в час, а закрывает их человек.
+    for part in cards.chunks(text):
+        await message.answer(part)
 
 
 @router.message(Command("stats"), IN_GROUP)

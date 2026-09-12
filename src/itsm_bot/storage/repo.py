@@ -11,10 +11,11 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from itsm_bot.security.redactor import PII_PLACEHOLDER, SECRET_PLACEHOLDER, redact
 from itsm_bot.storage.models import (
@@ -174,6 +175,13 @@ async def set_status(
         if status is TicketStatus.IN_PROGRESS
         else Ticket.taken_at
     )
+    # Повторное нажатие «Закрыть» не должно сдвигать отметку закрытия: иначе
+    # среднее время до закрытия в /stats растёт от лишнего клика. Возврат в работу
+    # по-прежнему очищает её — иначе заявка будет закрытой по времени и открытой
+    # по статусу.
+    closed_at = (
+        func.coalesce(Ticket.closed_at, now) if status in CLOSED_STATUSES else None
+    )
 
     result = await session.execute(
         update(Ticket)
@@ -181,7 +189,7 @@ async def set_status(
         .values(
             status=status,
             taken_at=taken_at,
-            closed_at=now if status in CLOSED_STATUSES else None,
+            closed_at=closed_at,
         )
     )
     await session.commit()
@@ -296,30 +304,43 @@ async def ticket_messages(session: AsyncSession, ticket_id: int) -> list[TicketM
 
 
 async def tickets_awaiting_answer(
-    session: AsyncSession, *, requester_id: str
+    session: AsyncSession,
+    *,
+    requester_id: str,
+    asked_before: datetime | None = None,
 ) -> list[Ticket]:
     """Открытые заявки сотрудника, последняя реплика в которых — вопрос исполнителя.
 
     Состояние «ждёт ответа» выводится из переписки, а не хранится колонкой (D15):
     отдельный флаг пришлось бы снимать в каждой ветке смены статуса, и он бы
     рассинхронизировался на первой же пропущенной.
+
+    `asked_before` отсекает вопросы, заданные позже, чем человек начал писать.
+    Сообщение, написанное до вопроса, ответом на него быть не может: сотрудник
+    пишет в 10:00, исполнитель спрашивает в 10:00:10, пачка собирается в 10:00:45 —
+    без этой отсечки новое обращение подшилось бы ответом на невидимый вопрос.
     """
-    last_direction = (
-        select(TicketMessage.direction)
+    last_message_id = (
+        select(TicketMessage.id)
         .where(TicketMessage.ticket_id == Ticket.id)
         .order_by(TicketMessage.id.desc())
         .limit(1)
         .scalar_subquery()
     )
+    last = aliased(TicketMessage)
     statement = (
         select(Ticket)
+        .join(last, last.id == last_message_id)
         .where(
             Ticket.requester_id == requester_id,
             Ticket.status.not_in(CLOSED_STATUSES),
-            last_direction == MessageDirection.TO_REQUESTER,
+            last.direction == MessageDirection.TO_REQUESTER,
         )
         .order_by(Ticket.id)
     )
+    if asked_before is not None:
+        statement = statement.where(last.created_at <= asked_before)
+
     return list((await session.execute(statement)).scalars())
 
 

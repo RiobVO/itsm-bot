@@ -122,7 +122,7 @@ async def edit_profile(
     await message.answer(cards.say("profile_restart", language))
 
 
-@router.message(Profile.room, F.text)
+@router.message(Profile.room, F.text, ~F.text.startswith("/"))
 async def receive_room(message: Message, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
     language = Language(data["language"])
@@ -133,12 +133,14 @@ async def receive_room(message: Message, state: FSMContext, settings: Settings) 
         await message.answer(cards.say("room_too_long", language))
         return
 
-    await state.update_data(room=room)
-    await state.set_state(Profile.department)
+    # Вопрос отправляется до смены состояния: в обратном порядке упавшая отправка
+    # оставила бы FSM ждать нажатия по клавиатуре, которой человек не получил.
     await message.answer(
         cards.say("ask_department", language),
         reply_markup=cards.departments_keyboard(settings.departments),
     )
+    await state.update_data(room=room)
+    await state.set_state(Profile.department)
 
 
 @router.callback_query(Profile.department, F.data.startswith("dept:"))
@@ -190,8 +192,12 @@ async def receive_department(
         await buffer.release(telegram_id)
 
 
-@router.message(Profile.room)
-@router.message(Profile.department)
+@router.message(Profile.room, ~F.text.startswith("/"))
+@router.message(Profile.department, ~F.text.startswith("/"))
 async def ignore_non_text_during_profile(message: Message) -> None:
-    """Стикер вместо номера кабинета не должен ломать анкету и не должен молчать."""
+    """Стикер вместо номера кабинета не должен ломать анкету и не должен молчать.
+
+    Команды исключены: иначе `/my` во время анкеты сохранился бы как номер кабинета,
+    а из состояния выбора отдела нельзя было бы выйти вообще ничем.
+    """
     await message.answer("Ответьте, пожалуйста, текстом.")

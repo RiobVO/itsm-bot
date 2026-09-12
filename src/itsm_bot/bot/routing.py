@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,8 +30,17 @@ class Decision:
     ticket_id: int | None = None
 
 
-async def decide(session: AsyncSession, *, requester_id: str) -> Decision:
-    waiting = await repo.tickets_awaiting_answer(session, requester_id=requester_id)
+async def decide(
+    session: AsyncSession, *, requester_id: str, asked_before: datetime | None = None
+) -> Decision:
+    """`asked_before` — момент, с которого человек начал писать пачку.
+
+    Вопрос, заданный позже этого момента, ответом считаться не может: автор его
+    ещё не видел, когда набирал текст.
+    """
+    waiting = await repo.tickets_awaiting_answer(
+        session, requester_id=requester_id, asked_before=asked_before
+    )
 
     if not waiting:
         return Decision(Kind.NEW)

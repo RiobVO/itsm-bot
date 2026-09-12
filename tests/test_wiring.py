@@ -71,7 +71,9 @@ def _message(
     )
 
 
-async def _first_matching_handler(dispatcher, message: Message) -> str | None:
+async def _first_matching_handler(
+    dispatcher, message: Message, raw_state: str | None = None
+) -> str | None:
     """Имя первого хендлера, чьи фильтры пропустили сообщение.
 
     Повторяет порядок, в котором aiogram обходит роутеры и хендлеры, но ничего не
@@ -82,7 +84,7 @@ async def _first_matching_handler(dispatcher, message: Message) -> str | None:
     исполнителя ловится в личной переписке.
     """
     for router in dispatcher.sub_routers:
-        context: dict[str, object] = {"bot": BOT}
+        context: dict[str, object] = {"bot": BOT, "raw_state": raw_state}
         passed, data = await router.message.check_root_filters(message, **context)
         if not passed:
             continue
@@ -171,3 +173,42 @@ class TestRouterOrder:
         names = [router.name for router in dispatcher.sub_routers]
 
         assert names == ["profile", "queue", "commands", "messages"]
+
+
+class TestDuringProfileSurvey:
+    """Состояния анкеты не должны проглатывать команды.
+
+    Без `raw_state` в контексте этот класс дефектов невидим: фильтр состояния
+    пропускает всё, и тест решил бы, что `/my` во время анкеты обрабатывается
+    командой, тогда как на живом боте он сохранялся бы как номер кабинета.
+    """
+
+    @pytest.mark.parametrize("state", ["Profile:waiting_start", "Profile:room", "Profile:department"])
+    async def test_my_is_not_eaten_by_the_survey(self, dispatcher, state: str) -> None:
+        message = _message("/my", chat_id=42, chat_type="private")
+
+        assert await _first_matching_handler(dispatcher, message, state) == "my_tickets"
+
+    @pytest.mark.parametrize("state", ["Profile:waiting_start", "Profile:room", "Profile:department"])
+    async def test_profile_restarts_the_survey_from_any_state(
+        self, dispatcher, state: str
+    ) -> None:
+        message = _message("/profile", chat_id=42, chat_type="private")
+
+        assert await _first_matching_handler(dispatcher, message, state) == "edit_profile"
+
+    async def test_room_answer_reaches_the_survey(self, dispatcher) -> None:
+        message = _message("312", chat_id=42, chat_type="private")
+
+        assert (
+            await _first_matching_handler(dispatcher, message, "Profile:room")
+            == "receive_room"
+        )
+
+    async def test_text_before_the_button_goes_to_the_buffer(self, dispatcher) -> None:
+        message = _message("и ещё не печатает", chat_id=42, chat_type="private")
+
+        assert (
+            await _first_matching_handler(dispatcher, message, "Profile:waiting_start")
+            == "collect_while_waiting"
+        )

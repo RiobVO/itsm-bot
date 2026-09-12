@@ -80,9 +80,18 @@ async def change_status(
         await callback.message.edit_text(
             text, reply_markup=cards.status_keyboard(ticket.id, ticket.status)
         )
-    except TelegramBadRequest:
-        # Карточка уже в этом виде: два нажатия подряд — обычное дело.
-        logger.info("Карточка заявки #%s не изменилась", ticket.id)
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error):
+            # Прочие 400 — «сообщение нельзя редактировать», ошибки разметки — это
+            # настоящий сбой: БД изменилась, карточка нет, и молчать о нём нельзя.
+            logger.exception("Не удалось перерисовать карточку заявки #%s", ticket.id)
+            await callback.answer(
+                f"Статус #{ticket.id} изменён, но карточка не обновилась",
+                show_alert=True,
+            )
+        else:
+            # Карточка уже в этом виде: два нажатия подряд — обычное дело.
+            logger.info("Карточка заявки #%s не изменилась", ticket.id)
     except Exception:
         logger.exception("Не удалось перерисовать карточку заявки #%s", ticket.id)
         await callback.answer(

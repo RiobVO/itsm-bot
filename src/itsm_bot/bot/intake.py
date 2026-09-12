@@ -70,7 +70,9 @@ class Intake:
             logger.warning("Обращение без профиля от %s", batch.telegram_id)
             return Result(Outcome.NO_PROFILE)
 
-        decision = await routing.decide(session, requester_id=batch.telegram_id)
+        decision = await routing.decide(
+            session, requester_id=batch.telegram_id, asked_before=batch.started_at
+        )
         if decision.kind is routing.Kind.ANSWER and decision.ticket_id is not None:
             return await self._answer(session, decision.ticket_id, batch)
 

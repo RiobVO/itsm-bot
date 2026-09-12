@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -17,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from itsm_bot.bot.buffer import Batch, MessageBuffer
 from itsm_bot.bot.intake import Intake, Outcome
 from itsm_bot.storage import repo
-from itsm_bot.storage.models import Language, MessageDirection, Ticket
+from itsm_bot.storage.models import Language, MessageDirection, Ticket, utcnow
 
 REQUESTER = "584112903"
 
@@ -33,8 +34,18 @@ async def _profile(session: AsyncSession, telegram_id: str = REQUESTER) -> None:
     )
 
 
-def _batch(text: str = "Принтер не печатает", telegram_id: str = REQUESTER) -> Batch:
-    return Batch(telegram_id=telegram_id, text=text, chat_id=7, first_message_id=100)
+def _batch(
+    text: str = "Принтер не печатает",
+    telegram_id: str = REQUESTER,
+    started_at: datetime | None = None,
+) -> Batch:
+    return Batch(
+        telegram_id=telegram_id,
+        text=text,
+        chat_id=7,
+        first_message_id=100,
+        started_at=started_at or utcnow(),
+    )
 
 
 @pytest.fixture
@@ -183,6 +194,51 @@ class TestAnswer:
             MessageDirection.TO_REQUESTER,
             MessageDirection.FROM_REQUESTER,
         ]
+
+
+class TestQuestionOrder:
+    """Вопрос, заданный позже, чем человек начал писать, не делает пачку ответом.
+
+    Сценарий из ревью: сотрудник пишет о новой проблеме в 10:00, исполнитель в
+    10:00:10 задаёт вопрос по другой заявке, пачка собирается в 10:00:45. Без учёта
+    порядка событий новая проблема подшилась бы ответом на вопрос, которого автор
+    ещё не видел, и заявка не завелась бы вовсе.
+    """
+
+    async def test_message_written_before_the_question_is_a_new_ticket(
+        self, session: AsyncSession, intake: Intake
+    ) -> None:
+        await _profile(session)
+        created = await intake.process(_batch(text="Принтер"))
+        assert created.ticket_id is not None
+
+        started_at = utcnow()
+        # Вопрос задан уже после того, как человек начал набирать текст.
+        await repo.add_message(
+            session, created.ticket_id, MessageDirection.TO_REQUESTER, "Какая модель?"
+        )
+
+        result = await intake.process(_batch(text="Ещё не работает вход", started_at=started_at))
+
+        assert result.outcome is Outcome.CREATED
+        assert await _count_tickets(session) == 2
+
+    async def test_message_written_after_the_question_is_an_answer(
+        self, session: AsyncSession, intake: Intake
+    ) -> None:
+        await _profile(session)
+        created = await intake.process(_batch(text="Принтер"))
+        assert created.ticket_id is not None
+        await repo.add_message(
+            session, created.ticket_id, MessageDirection.TO_REQUESTER, "Какая модель?"
+        )
+
+        result = await intake.process(
+            _batch(text="HP M404", started_at=utcnow() + timedelta(seconds=1))
+        )
+
+        assert result.outcome is Outcome.ANSWERED
+        assert await _count_tickets(session) == 1
 
 
 class TestDuplicate:

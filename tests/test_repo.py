@@ -743,6 +743,40 @@ class TestConcurrentStatusChanges:
             assert final.taken_at == original_taken_at
 
 
+class TestCloseIsIdempotent:
+    async def test_second_close_does_not_move_closed_at(
+        self, session: AsyncSession
+    ) -> None:
+        """Лишний клик по «Закрыть» не должен растягивать время до закрытия в /stats."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+
+        first = await repo.set_status(session, ticket.id, TicketStatus.DONE)
+        assert first is not None and first.closed_at is not None
+        closed_at = first.closed_at
+
+        second = await repo.set_status(session, ticket.id, TicketStatus.DONE)
+
+        assert second is not None
+        assert second.closed_at == closed_at
+
+    async def test_reopening_still_clears_closed_at(self, session: AsyncSession) -> None:
+        """Возврат в работу обязан снимать отметку: иначе заявка закрыта по времени
+        и открыта по статусу, и отчёт по длительности врёт."""
+        employee = await _employee(session)
+        ticket = await repo.create_ticket(
+            session, employee=employee, text="Принтер", source_chat_id=1, source_message_id=1
+        )
+        await repo.set_status(session, ticket.id, TicketStatus.DONE)
+
+        reopened = await repo.set_status(session, ticket.id, TicketStatus.IN_PROGRESS)
+
+        assert reopened is not None
+        assert reopened.closed_at is None
+
+
 class TestAwaitingAnswer:
     """D15: ответ заявителя привязывается к заявке, у которой последняя реплика — вопрос."""
 

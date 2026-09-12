@@ -28,6 +28,9 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
+
+from itsm_bot.storage.models import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +44,22 @@ class Batch:
     chat_id: int
     first_message_id: int
 
+    started_at: datetime
+    """Когда пришло первое сообщение пачки.
+
+    Нужно, чтобы отличить ответ на вопрос от обращения, написанного раньше вопроса:
+    человек пишет в 10:00, исполнитель задаёт вопрос в 10:00:10, пачка собирается в
+    10:00:45 — без этой отметки она подшилась бы ответом на вопрос, которого автор
+    ещё не видел.
+    """
+
 
 @dataclass
 class _Pending:
     lines: list[str] = field(default_factory=list)
     chat_id: int = 0
     first_message_id: int = 0
+    started_at: datetime = field(default_factory=utcnow)
     timer: asyncio.Task[None] | None = None
 
 
@@ -145,6 +158,7 @@ class MessageBuffer:
                 text="\n".join(pending.lines),
                 chat_id=pending.chat_id,
                 first_message_id=pending.first_message_id,
+                started_at=pending.started_at,
             )
 
     async def _deliver(self, batch: Batch) -> None:
