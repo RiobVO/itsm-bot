@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from itsm_bot.bot.buffer import Batch, MessageBuffer
+from itsm_bot.storage.models import utcnow
 
 WINDOW = 0.05
 
@@ -279,3 +280,46 @@ class TestFlushFailure:
         await asyncio.sleep(WINDOW * 4)
 
         assert [item.text for item in attempts] == ["раз", "два"]
+
+
+class TestReceiveTime:
+    """Время события фиксируется до ожидания блокировки, а не после.
+
+    По нему `intake` отличает ответ на вопрос от обращения, написанного раньше
+    вопроса. Если брать его после захвата блокировки, обработка предыдущей пачки,
+    держащая ту же блокировку на сетевой публикации, сдвинет отметку вперёд — и
+    обращение снова подшьётся ответом на вопрос, которого автор не видел.
+    """
+
+    async def test_started_at_precedes_waiting_for_the_lock(self) -> None:
+        collected, flush = _collector()
+        buffer = MessageBuffer(window_seconds=10, flush=flush)
+
+        lock = buffer.lock("42")
+        await lock.acquire()
+
+        adding = asyncio.create_task(
+            buffer.add("42", text="принтер", chat_id=7, message_id=100)
+        )
+        await asyncio.sleep(0.05)
+        released_at = utcnow()
+        lock.release()
+        await adding
+
+        await buffer.release("42")
+
+        assert collected[0].started_at < released_at
+
+    async def test_started_at_is_the_first_message_not_the_last(self) -> None:
+        """Пачка датируется началом, иначе дописанная строка сдвинет её вперёд."""
+        collected, flush = _collector()
+        buffer = MessageBuffer(window_seconds=10, flush=flush)
+
+        await buffer.add("42", text="раз", chat_id=7, message_id=100)
+        first_added_at = utcnow()
+        await asyncio.sleep(0.05)
+        await buffer.add("42", text="два", chat_id=7, message_id=101)
+
+        await buffer.release("42")
+
+        assert collected[0].started_at <= first_added_at

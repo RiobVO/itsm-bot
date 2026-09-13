@@ -81,10 +81,25 @@ class MessageBuffer:
         self, telegram_id: str, *, text: str, chat_id: int, message_id: int
     ) -> None:
         """Добавляет сообщение в пачку и перезапускает окно."""
+        # Время события фиксируется ДО ожидания блокировки. Внутри неё оно было бы
+        # временем не получения сообщения, а получения доступа: обработка предыдущей
+        # пачки держит ту же блокировку на сетевой публикации, и сообщение,
+        # пришедшее раньше вопроса исполнителя, получило бы отметку позже него — и
+        # снова подшилось бы ответом на невидимый вопрос.
+        #
+        # Источник времени — собственные часы, а не `message.date`: отметки вопросов
+        # ставит та же `utcnow()`, и сравнивать их со временем Telegram значило бы
+        # сравнивать показания двух часов с неизвестным расхождением.
+        received_at = utcnow()
+
         async with self.lock(telegram_id):
             pending = self._pending.get(telegram_id)
             if pending is None:
-                pending = _Pending(chat_id=chat_id, first_message_id=message_id)
+                pending = _Pending(
+                    chat_id=chat_id,
+                    first_message_id=message_id,
+                    started_at=received_at,
+                )
                 self._pending[telegram_id] = pending
 
             pending.lines.append(text)
