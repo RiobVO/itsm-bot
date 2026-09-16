@@ -40,16 +40,27 @@ class Profile(StatesGroup):
 
 
 async def invite_to_profile(
-    message: Message, state: FSMContext, language: Language, buffer: MessageBuffer
+    message: Message,
+    state: FSMContext,
+    language: Language,
+    buffer: MessageBuffer,
+    *,
+    request_possible: bool,
 ) -> None:
     """Предлагает заполнить профиль и останавливает окно склейки.
 
     Вопрос про кабинет здесь не задаётся: пока человек не нажал кнопку, его текст —
     это продолжение обращения, а не ответ анкеты.
+
+    `request_possible` — ждёт ли профиля обращение. Анкету начинают и с `/start`, где
+    обращения не было вовсе, и от него зависит, чем анкета закончится при пустом
+    буфере: просьба повторить обращение тому, кто ничего не писал, — ложь.
     """
     buffer.hold(str(message.from_user.id))
     await state.set_state(Profile.waiting_start)
-    await state.update_data(language=language.value)
+    await state.update_data(
+        language=language.value, request_possible=request_possible
+    )
     await message.answer(
         cards.say("profile_needed", language),
         reply_markup=cards.start_profile_keyboard(language),
@@ -89,18 +100,50 @@ async def collect_while_waiting(
     )
 
 
-@router.callback_query(Profile.waiting_start, F.data == "profile:start")
-async def begin_profile(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "profile:start")
+async def begin_profile(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    buffer: MessageBuffer,
+) -> None:
     """Состояние переключается только после того, как вопрос доставлен.
 
     В обратном порядке упавшая отправка оставила бы FSM в `Profile.room` при
-    невидимом вопросе, и следующая фраза обращения стала бы номером кабинета.
+    невидимом вопросе, и следующая фраза обращения стала бы номером кабинета. По той
+    же причине буфер удерживается после отправки: упавший вызов оставил бы held без
+    состояния, и для сотрудника с профилем бот замолчал бы до перезапуска.
+
+    Фильтра по `Profile.waiting_start` здесь намеренно нет. Состояние живёт в
+    `MemoryStorage` и не переживает перезапуск процесса, а кнопка остаётся в
+    переписке — с фильтром нажатие не находило бы хендлера, и бот молчал бы.
     """
+    telegram_id = str(callback.from_user.id)
     data = await state.get_data()
-    language = Language(data["language"])
+    if "language" in data:
+        language = Language(data["language"])
+    else:
+        # Данных нет — состояние не пережило перезапуск. Язык тогда берётся из
+        # профиля, а локаль Telegram — только за неимением профиля: иначе сотрудник
+        # с английским профилем незаметно переключился бы на русский, потому что
+        # `receive_department` пишет выбранный здесь язык обратно в `employees` (D14).
+        employee = await repo.get_employee(session, telegram_id)
+        language = (
+            employee.language
+            if employee
+            else cards.language_from_code(callback.from_user.language_code)
+        )
 
     await callback.message.answer(cards.say("ask_room", language))
+    buffer.hold(telegram_id)
     await state.set_state(Profile.room)
+    # Вместе с состоянием пропадает и то, ради чего анкету показали. Узнать это
+    # заново неоткуда, поэтому считаем, что обращение было: промолчать о потерянном
+    # обращении хуже, чем переспросить о том, которого не было.
+    await state.update_data(
+        language=language.value,
+        request_possible=data.get("request_possible", True),
+    )
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer()
 
@@ -118,7 +161,11 @@ async def edit_profile(
     )
     buffer.hold(str(message.from_user.id))
     await state.set_state(Profile.room)
-    await state.update_data(language=language.value)
+    # Профиля ещё нет — значит, анкету начали не ради правки: сюда приходят по совету
+    # `stale_department`, когда обращение уже ждало профиля, а состояние потерялось.
+    await state.update_data(
+        language=language.value, request_possible=employee is None
+    )
     await message.answer(cards.say("profile_restart", language))
 
 
@@ -184,12 +231,50 @@ async def receive_department(
                 "profile_saved", language, room=data["room"], department=department
             )
         )
-        await callback.answer()
     finally:
         # Снятие удержания не должно зависеть от того, дошли ли поздравления:
         # иначе упавший вызов Telegram оставит буфер held навсегда, и бот замолчит
         # для этого человека до перезапуска.
-        await buffer.release(telegram_id)
+        delivered = await buffer.release(telegram_id)
+
+    if not delivered and data.get("request_possible", True):
+        # Анкета кончилась, а заявки не вышло: обращение, которое её и вызвало, унёс
+        # перезапуск процесса (D13). Без этой просьбы человек ждёт номер заявки,
+        # которой не будет.
+        #
+        # Просьба условная, потому что признак условный: наверняка известно только
+        # обратное — что писавший `/start` или правящий профиль ничего не отправлял.
+        # Всё остальное, включая потерянное состояние, оставляет вопрос открытым.
+        await callback.message.answer(cards.say("repeat_request", language))
+
+    # Подтверждение нажатия — последним: оно всего лишь гасит часики у кнопки, а
+    # падает штатно (просроченный callback query). Раньше по коду оно уносило бы с
+    # собой просьбу повторить обращение — то самое молчание, ради которого всё это.
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dept:"))
+async def stale_department(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    """Кнопка отдела из прошлого процесса: номер кабинета пропал вместе с состоянием.
+
+    Стоит после `receive_department` и получает только то, что тот не взял. Взять
+    анкету отсюда нельзя — кабинет спрашивать заново, — но и промолчать нельзя:
+    нажатие без ответа читается как сломанный бот. Буфер остаётся удержанным:
+    обращение всё ещё ждёт профиля, и `/profile` доведёт анкету до конца.
+
+    Про возможно потерянное обращение говорится здесь, а не в конце анкеты: это
+    единственная точка, где известно, что анкету оборвали, — и она же единственная
+    для сотрудника с профилем, у которого `/profile` ничего не обещал.
+    """
+    employee = await repo.get_employee(session, str(callback.from_user.id))
+    language = (
+        employee.language
+        if employee
+        else cards.language_from_code(callback.from_user.language_code)
+    )
+    await callback.answer(cards.say("profile_interrupted", language), show_alert=True)
 
 
 @router.message(Profile.room, ~F.text.startswith("/"))

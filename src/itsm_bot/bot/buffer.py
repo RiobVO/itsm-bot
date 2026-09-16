@@ -119,12 +119,20 @@ class MessageBuffer:
         if pending is not None:
             self._cancel_timer(pending)
 
-    async def release(self, telegram_id: str) -> None:
-        """Снимает удержание и отправляет пачку немедленно: ждать больше нечего."""
+    async def release(self, telegram_id: str) -> bool:
+        """Снимает удержание и отправляет пачку немедленно: ждать больше нечего.
+
+        Возвращает, ушла ли пачка. Анкету можно закончить и в процессе, который
+        обращения не получал: перезапуск уносит буфер (D13), а кнопка остаётся в
+        переписке. Тогда заявки не будет, и сказать об этом человеку должен
+        вызывающий — молча закончить анкету значит оставить его ждать номер.
+        """
         self._held.discard(telegram_id)
         batch = await self._take(telegram_id)
-        if batch is not None:
-            await self._deliver(batch)
+        if batch is None:
+            return False
+        await self._deliver(batch)
+        return True
 
     async def close(self) -> None:
         """Снимает таймеры при остановке процесса. Недособранное не досылается (D13)."""

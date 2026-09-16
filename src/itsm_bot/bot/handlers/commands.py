@@ -45,6 +45,9 @@ async def start(
             state,
             cards.language_from_code(message.from_user.language_code),
             buffer,
+            # `/start` — это знакомство, а не обращение: буфер пуст законно, и анкета
+            # не должна закончиться просьбой повторить то, чего человек не писал.
+            request_possible=False,
         )
         return
 

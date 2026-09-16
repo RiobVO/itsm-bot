@@ -16,7 +16,7 @@ import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import Chat, Message, User
+from aiogram.types import CallbackQuery, Chat, Message, User
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from itsm_bot.bot.main import build_dispatcher
@@ -69,6 +69,37 @@ def _message(
         text=text,
         reply_to_message=reply_to,
     )
+
+
+def _callback(data: str) -> CallbackQuery:
+    """Нажатие кнопки под сообщением бота в личке."""
+    return CallbackQuery(
+        id="cb1",
+        from_user=User(id=42, is_bot=False, first_name="Пётр", language_code="ru"),
+        chat_instance="ci1",
+        data=data,
+        message=_message("Заполнить", chat_id=42, chat_type="private"),
+    )
+
+
+async def _first_matching_callback_handler(
+    dispatcher, callback: CallbackQuery, raw_state: str | None = None
+) -> str | None:
+    """То же, что `_first_matching_handler`, но для шины колбэков."""
+    for router in dispatcher.sub_routers:
+        context: dict[str, object] = {"bot": BOT, "raw_state": raw_state}
+        passed, data = await router.callback_query.check_root_filters(
+            callback, **context
+        )
+        if not passed:
+            continue
+
+        context.update(data or {})
+        for handler in router.callback_query.handlers:
+            passed, _data = await handler.check(callback, **context)
+            if passed:
+                return handler.callback.__name__
+    return None
 
 
 async def _first_matching_handler(
@@ -211,4 +242,46 @@ class TestDuringProfileSurvey:
         assert (
             await _first_matching_handler(dispatcher, message, "Profile:waiting_start")
             == "collect_while_waiting"
+        )
+
+
+class TestKeyboardsAfterRestart:
+    """Кнопка из сообщения прошлого процесса обязана находить хендлер.
+
+    `MemoryStorage` теряет состояние анкеты при перезапуске, и фильтр по состоянию
+    делает кнопку мёртвой: нажатие без хендлера — это молчащий бот. Найдено живым
+    прогоном 15.09.2026 на «Заполнить»; кнопка отдела ломалась тем же способом.
+    """
+
+    async def test_fill_in_button_works_without_state(self, dispatcher) -> None:
+        assert (
+            await _first_matching_callback_handler(dispatcher, _callback("profile:start"))
+            == "begin_profile"
+        )
+
+    async def test_fill_in_button_works_in_its_own_state(self, dispatcher) -> None:
+        """Обычный путь не должен пострадать от снятого фильтра."""
+        assert (
+            await _first_matching_callback_handler(
+                dispatcher, _callback("profile:start"), "Profile:waiting_start"
+            )
+            == "begin_profile"
+        )
+
+    async def test_department_button_without_state_is_answered(self, dispatcher) -> None:
+        """Номер кабинета пропал вместе с состоянием — анкету придётся начать заново."""
+        assert (
+            await _first_matching_callback_handler(dispatcher, _callback("dept:0"))
+            == "stale_department"
+        )
+
+    async def test_department_button_in_its_state_reaches_the_survey(
+        self, dispatcher
+    ) -> None:
+        """Заглушка стоит после рабочего хендлера и не должна перехватывать анкету."""
+        assert (
+            await _first_matching_callback_handler(
+                dispatcher, _callback("dept:0"), "Profile:department"
+            )
+            == "receive_department"
         )

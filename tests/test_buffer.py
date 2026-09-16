@@ -199,18 +199,27 @@ class TestHold:
 
         buffer.hold("42")
         await buffer.add("42", text="принтер", chat_id=7, message_id=100)
-        await buffer.release("42")
+        delivered = await buffer.release("42")
 
         assert [item.text for item in collected] == ["принтер"]
+        assert delivered is True
 
     async def test_release_without_pending_is_silent(self) -> None:
+        """Пустой буфер отличим от отправленной пачки.
+
+        Анкету можно закончить и в процессе, который обращения не получал:
+        перезапуск уносит буфер (D13), а кнопка остаётся в переписке. Хендлер по
+        этому признаку решает, просить ли написать обращение заново, — вернуть
+        `True` без пачки значит пообещать заявку, которой не будет.
+        """
         collected, flush = _collector()
         buffer = MessageBuffer(window_seconds=10, flush=flush)
 
         buffer.hold("42")
-        await buffer.release("42")
+        delivered = await buffer.release("42")
 
         assert collected == []
+        assert delivered is False
 
     async def test_messages_during_hold_are_glued_together(self) -> None:
         """Человек дописывает подробности, пока отвечает на анкету."""

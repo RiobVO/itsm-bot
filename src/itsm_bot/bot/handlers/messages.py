@@ -64,4 +64,5 @@ async def incoming(
             state,
             cards.language_from_code(message.from_user.language_code),
             buffer,
+            request_possible=True,
         )
